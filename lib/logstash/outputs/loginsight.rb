@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 require "logstash/outputs/http"
+require "syslog_protocol"
 
 # This output plugin is used to send Events to a VMware vRealize Log Insight cluster,
 # preserving existing fields on Events as key=value fields. Timestamps are transmitted
@@ -87,18 +88,30 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
     # For each event
     events.each do |event|
       # Create an outbound event; this can be serialized to json and sent
-      event_hash = {
-        'timestamp' => timestamp_in_milliseconds(event.get('@timestamp')),
-        'text' => (event.get('message') or ''),
-      }
-
-      # Map fields from the event to the desired form
-      event_hash['fields'] = merge_hash(event.to_hash)
-        .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
-        .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
-        .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
-
-        messages.push(event_hash)
+      p = SyslogProtocol.parse(event.get('message'))
+      event_hash = {}    
+      if p.facility == 20
+        event_hash = {
+          'timestamp' => timestamp_in_milliseconds(p.time),
+          'text' => (p.content or ''),
+        } 
+        @logger.debug("Syslog message from ESX")
+        event_hash['fields'] = merge_hash(to_hash(p))
+          .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
+          .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
+          .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
+      else
+        event_hash = {
+          'timestamp' => timestamp_in_milliseconds(event.get('@timestamp')),
+          'text' => (event.get('message') or ''),
+        }
+        @logger.debug("Message is from elsewhere")
+        event_hash['fields'] = merge_hash(event.to_hash)
+          .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
+          .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
+          .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
+      end
+      messages.push(event_hash)
     end # events.each do
 
     { 'events' => messages }  # Framing required by CFAPI.
@@ -107,6 +120,13 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
   # Return a copy of the fieldname with non-alphanumeric characters removed.
   def safefield(fieldname)
     fieldname.gsub(/[^a-zA-Z0-9_]/, '')  # TODO: Correct pattern for a valid fieldname. Must deny leading numbers.
+  end
+
+  def to_hash(packet)
+    hash = {}
+    hash["host"] = packet.hostname
+    hash["severity"] = packet.severity
+    hash
   end
 
   # Recursively merge a nested dictionary into a flat dictionary with dotted keys.
