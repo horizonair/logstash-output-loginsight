@@ -3,7 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 require "logstash/outputs/http"
-require "syslog_protocol"
+require "time"
+require_relative "common"
+require_relative "logger"
+require_relative "packet"
+
 
 # This output plugin is used to send Events to a VMware vRealize Log Insight cluster,
 # preserving existing fields on Events as key=value fields. Timestamps are transmitted
@@ -88,9 +92,9 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
     # For each event
     events.each do |event|
       # Create an outbound event; this can be serialized to json and sent
-      p = SyslogProtocol.parse(event.get('message'))
+      p = parse(event.get('message'))
       event_hash = {}    
-      if p.facility == 20
+      #if p.facility == 20
         event_hash = {
           'timestamp' => timestamp_in_milliseconds(p.time),
           'text' => (p.content or ''),
@@ -100,17 +104,17 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
           .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
           .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
           .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
-      else
-        event_hash = {
-          'timestamp' => timestamp_in_milliseconds(event.get('@timestamp')),
-          'text' => (event.get('message') or ''),
-        }
-        @logger.debug("Message is from elsewhere")
-        event_hash['fields'] = merge_hash(event.to_hash)
-          .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
-          .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
-          .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
-      end
+      #else
+      #  event_hash = {
+      #    'timestamp' => timestamp_in_milliseconds(event.get('@timestamp')),
+      #    'text' => (event.get('message') or ''),
+      #  }
+      #  @logger.debug("Message is from elsewhere")
+      #  event_hash['fields'] = merge_hash(event.to_hash)
+      #    .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
+      #    .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
+      #    .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
+      #end
       messages.push(event_hash)
     end # events.each do
 
@@ -146,4 +150,67 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
     end
   end
 
+  def parse(msg, origin=nil)
+    packet = Packet.new
+    original_msg = msg.dup
+    pri = parse_pri(msg)
+    if pri and (pri = pri.to_i).is_a? Integer and (0..191).include?(pri)
+      packet.pri = pri
+    else
+      # If there isn't a valid PRI, treat the entire message as content
+      packet.pri = 13
+      packet.time = Time.now
+      packet.hostname = origin || 'unknown'
+      packet.content = original_msg
+      return packet
+    end
+    time = parse_time(msg)
+    if time
+      packet.time = Time.parse(time)
+    else
+      packet.time = Time.now
+    end
+    msg = msg.strip
+    hostname = parse_hostname(msg)
+    packet.hostname = hostname || origin
+    if m = msg.match(/^(\w+)(: | )(.*)$/)
+      packet.tag = m[1]
+      packet.content = m[3]
+    else
+      packet.tag = 'unknown'
+      packet.content = msg.strip
+    end
+    packet
+  end
+  
+  private
+  def parse_pri(msg)
+    pri = msg.slice!(/<(\d\d?\d?)>/)
+    pri = pri.slice(/\d\d?\d?/) if pri
+    if !pri or (pri =~ /^0/ and pri !~ /^0$/)
+      return nil
+    else
+      return pri
+    end
+  end
+  
+  def parse_time(msg)
+    time = msg.slice!(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s(\s|[1-9])\d\s\d\d:\d\d:\d\d\s/)
+    if (time)
+      return time
+    else
+      # Parse ISO8601 date
+      time = msg.slice!(/^\d\d\d\d(-\d\d(-\d\d(T\d\d:\d\d(:\d\d)?(\.\d+)?(([+-]\d\d:\d\d)|Z)?)?)?)?/)
+      if (time)
+        return time
+      else
+        # Parse vCenter time (prefix with digit)
+        return msg.slice!(/^\d \d\d\d\d(-\d\d(-\d\d(T\d\d:\d\d(:\d\d)?(\.\d+)?(([+-]\d\d:\d\d)|Z)?)?)?)?/)
+      end 
+    end
+  end
+  
+  def parse_hostname(msg)
+    msg.slice!(/^[\x21-\x7E]+/).rstrip
+  end
 end # class LogStash::Outputs::Loginsight
