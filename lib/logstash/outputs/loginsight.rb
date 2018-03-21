@@ -39,6 +39,13 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
       '@timestamp' => nil,  # drop, already mapped to "timestamp" in event_hash
       'message' => nil,  # drop, already mapped to "text" in event_hash
       'timestamp' => 'timestamp_',  # Log Insight will refuse events with a "timestamp" field.
+      'beat_name' => nil,
+      #'beat_hostname' => nil,
+      'beat_version' => nil,
+      #'tags' => nil,
+      'source' => 'filepath',
+      'prospector_type' => nil,
+      'offset' => nil
   }
 
   config :url, :validate => :string, :default => nil, :deprecated => 'Use "host", "port", "proto" and "uuid" instead.'
@@ -85,36 +92,50 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
     (timestamp.to_f * 1000).to_i
   end
 
+  def get_value(name, event)
+    LogStash::Json.dump(event.get(name))
+  end
+
   # Frame the events in the hash-array structure required by Log Insight
   def cfapi(events)
     messages = []
 
     # For each event
     events.each do |event|
-      # Create an outbound event; this can be serialized to json and sent
-      p = parse(event.get('message'))
-      event_hash = {}    
-      #if p.facility == 20
-        event_hash = {
-          'timestamp' => timestamp_in_milliseconds(p.time),
-          'text' => (p.content or ''),
-        } 
-        @logger.debug("Syslog message from ESX")
-        event_hash['fields'] = merge_hash(to_hash(p))
+      event_hash = {
+        'timestamp' => timestamp_in_milliseconds(event.get('@timestamp'))
+      }
+      @logger.debug("plugin event received [#{event}]")
+      metadata = event.get('[@metadata]')
+      if metadata.has_key? "beat"
+        # This is a beats message, process it.      
+        @logger.debug("metadata [#{event.get('[@metadata]')}]")
+        @logger.debug("process beat event => #{event.get('beat')}")
+
+        # We will parse the beat message similar to syslog to get the time and hostname
+        p = parse_beat(event.get('message'))
+
+        # Create an outbound event; this can be serialized to json and sent
+        event_hash['text'] = (p.content or '')
+
+        # Map fields from the event to the desired form
+        @logger.debug("Event.to_hash => #{event.to_hash}")
+        @logger.debug("Event.to_hash.merge(to_hash(p)) => #{event.to_hash.merge(to_hash(p))}")
+        fields_hash = merge_hash(event.to_hash.merge(to_hash(p)))
+        
+      else
+        # Create an outbound event; this can be serialized to json and sent
+        p = parse_syslog(event.get('message'))
+        event_hash['text'] = (p.content or '')
+        fields_hash = merge_hash(to_hash(p))
+        
+      end # is non-beats message
+      event_hash['fields'] = fields_hash
           .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
           .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
           .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
-      #else
-      #  event_hash = {
-      #    'timestamp' => timestamp_in_milliseconds(event.get('@timestamp')),
-      #    'text' => (event.get('message') or ''),
-      #  }
-      #  @logger.debug("Message is from elsewhere")
-      #  event_hash['fields'] = merge_hash(event.to_hash)
-      #    .reject { |key,value| @adjusted_fields.has_key?(key) and @adjusted_fields[key] == nil }  # drop banned fields
-      #    .map {|k,v| [ @adjusted_fields.has_key?(k) ? @adjusted_fields[k] : k,v] }  # rename fields
-      #    .map {|k,v| { 'name' => (safefield(k)), 'content' => v } }  # Convert a hashmap {k=>v, k2=>v2} to a list [{name=>k, content=>v}, {name=>k2, content=>v2}]
-      #end
+
+      @logger.debug("Hash [#{event_hash}]")
       messages.push(event_hash)
     end # events.each do
 
@@ -129,7 +150,7 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
   def to_hash(packet)
     hash = {}
     hash["host"] = packet.hostname
-    hash["severity"] = packet.severity
+    hash["severity"] = packet.severity ? packet.severity : SEVERITIES['notice']
     hash
   end
 
@@ -150,7 +171,29 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
     end
   end
 
-  def parse(msg, origin=nil)
+  def parse_beat(msg, origin=nil)
+    packet = Packet.new
+    original_msg = msg.dup
+    time = parse_time(msg)
+    if time
+      packet.time = Time.parse(time)
+    else
+      packet.time = Time.now
+    end
+    msg = msg.strip
+    hostname = parse_hostname(msg)
+    packet.hostname = hostname || origin
+    if m = msg.match(/^(\w+)(: | )(.*)$/)
+      packet.tag = m[1]
+      packet.content = m[3]
+    else
+      packet.tag = 'unknown'
+      packet.content = msg.strip
+    end
+    packet
+  end
+
+  def parse_syslog(msg, origin=nil)
     packet = Packet.new
     original_msg = msg.dup
     pri = parse_pri(msg)
