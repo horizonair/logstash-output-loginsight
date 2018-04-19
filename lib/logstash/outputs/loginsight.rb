@@ -113,16 +113,23 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
         @logger.debug("process beat event => #{event.get('beat')}")
 
         # We will parse the beat message similar to syslog to get the time and hostname
-        p = parse_beat(event.get('message'))
+        if event.get('type') != 'wineventlog' and event.get('message')
+          p = parse_beat(event.get('message'))
 
-        # Create an outbound event; this can be serialized to json and sent
-        event_hash['text'] = (p.content or '')
+          # Create an outbound event; this can be serialized to json and sent
+          event_hash['text'] = (p.content or '')
+        else
+          event_hash['text'] = event.get('message')
+        end
 
         # Map fields from the event to the desired form
         @logger.debug("Event.to_hash => #{event.to_hash}")
-        @logger.debug("Event.to_hash.merge(to_hash(p)) => #{event.to_hash.merge(to_hash(p))}")
-        fields_hash = merge_hash(event.to_hash.merge(to_hash(p)))
-        
+        if p.nil?
+          fields_hash = event.to_hash
+        else
+          @logger.debug("Event.to_hash.merge(to_hash(p)) => #{event.to_hash.merge(to_hash(p))}")
+          fields_hash = merge_hash(event.to_hash.merge(to_hash(p)))
+        end
       else
         # Create an outbound event; this can be serialized to json and sent
         p = parse_syslog(event.get('message'))
