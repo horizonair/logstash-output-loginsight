@@ -107,18 +107,19 @@ class LogStash::Outputs::Loginsight < LogStash::Outputs::Http
       }
       @logger.debug("plugin event received [#{event}]")
       metadata = event.get('[@metadata]')
-      if metadata.has_key? "beat"
+      if event.get("beat")
         # This is a beats message, process it.      
         @logger.debug("metadata [#{event.get('[@metadata]')}]")
         @logger.debug("process beat event => #{event.get('beat')}")
 
         # We will parse the beat message similar to syslog to get the time and hostname
         if event.get('type') != 'wineventlog' and event.get('message')
-          p = parse_beat(event.get('message'))
-
-          # Create an outbound event; this can be serialized to json and sent
-          event_hash['text'] = (p.content or '')
+          # This is a filebeat
+          event_hash['host'] = event.get('hostname')
+          event_hash['severity'] = SEVERITIES['notice']
+          event_hash['text'] = event.get('message')
         else
+          event_hash['host'] = event.get('hostname')
           event_hash['text'] = event.get('message')
         end
 
